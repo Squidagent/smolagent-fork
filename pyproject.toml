@@ -129,6 +129,14 @@ lint.select = ["E", "F", "I", "W"]
 known-first-party = ["smolagents"]
 lines-after-imports = 2
 
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["smolagents*"]
+namespaces = false
+
 [tool.setuptools.package-data]
 "smolagents.prompts" = ["*.yaml"]
 
