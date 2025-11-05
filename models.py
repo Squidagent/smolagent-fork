@@ -1157,24 +1157,22 @@ class ApiModel(Model):
         """Apply rate limiting before making API calls."""
         self.rate_limiter.throttle()
 
-
 class LiteLLMModel(ApiModel):
     """Model to use [LiteLLM Python SDK](https://docs.litellm.ai/docs/#litellm-python-sdk) to access hundreds of LLMs.
-
+    
     Parameters:
-        model_id (`str`):
-            The model identifier to use on the server (e.g. "gpt-3.5-turbo").
-        api_base (`str`, *optional*):
-            The base URL of the provider API to call the model.
-        api_key (`str`, *optional*):
-            The API key to use for authentication.
-        custom_role_conversions (`dict[str, str]`, *optional*):
-            Custom role conversion mapping to convert message roles in others.
+        model_id (str): The model identifier to use on the server (e.g. "gpt-3.5-turbo").
+        api_base (str, *optional*): The base URL of the provider API to call the model.
+        api_key (str, *optional*): The API key to use for authentication.
+        custom_role_conversions (dict[str, str], *optional*): Custom role conversion mapping to convert message roles in others.
             Useful for specific models that do not support specific message roles like "system".
-        flatten_messages_as_text (`bool`, *optional*): Whether to flatten messages as text.
-            Defaults to `True` for models that start with "ollama", "groq", "cerebras".
-        **kwargs:
-            Additional keyword arguments to forward to the underlying LiteLLM completion call.
+        flatten_messages_as_text (bool, *optional*): Whether to flatten messages as text.
+            Defaults to True for models that start with "ollama", "groq", "cerebras".
+        enable_builtin_tools (bool, *optional*): Whether to enable built-in tools like web_search.
+            Defaults to False for backward compatibility.
+        builtin_tools (list[dict], *optional*): List of built-in tools to enable (e.g., [{"type": "web_search"}]).
+            Only used if enable_builtin_tools is True.
+        **kwargs: Additional keyword arguments to forward to the underlying LiteLLM completion call.
     """
 
     def __init__(
@@ -1184,6 +1182,8 @@ class LiteLLMModel(ApiModel):
         api_key: str | None = None,
         custom_role_conversions: dict[str, str] | None = None,
         flatten_messages_as_text: bool | None = None,
+        enable_builtin_tools: bool = False,
+        builtin_tools: list[dict] | None = None,
         **kwargs,
     ):
         if not model_id:
@@ -1194,13 +1194,18 @@ class LiteLLMModel(ApiModel):
                 FutureWarning,
             )
             model_id = "anthropic/claude-3-5-sonnet-20240620"
+
         self.api_base = api_base
         self.api_key = api_key
+        self.enable_builtin_tools = enable_builtin_tools
+        self.builtin_tools = builtin_tools or []
+
         flatten_messages_as_text = (
             flatten_messages_as_text
             if flatten_messages_as_text is not None
             else model_id.startswith(("ollama", "groq", "cerebras"))
         )
+
         super().__init__(
             model_id=model_id,
             custom_role_conversions=custom_role_conversions,
@@ -1208,25 +1213,74 @@ class LiteLLMModel(ApiModel):
             **kwargs,
         )
 
+        # Track the last Response for threading tool calls
+        self._last_response_id: str | None = None
+        self._last_tool_calls: list | None = None
+
     def create_client(self):
         """Create the LiteLLM client."""
         try:
             import litellm
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError(
-                "Please install 'litellm' extra to use LiteLLMModel: `pip install 'smolagents[litellm]'`"
+                "Please install 'litellm' extra to use LiteLLMModel: pip install 'smolagents[litellm]'"
             ) from e
-
         return litellm
 
+    def _find_last_assistant_message_index(self, messages: list) -> int:
+        """Find the index of the last assistant message in the conversation.
+        
+        Returns -1 if no assistant message is found.
+        """
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            role = msg.get("role")
+            if hasattr(role, "value"):
+                role = role.value
+            if role == "assistant":
+                return i
+        return -1
+
+    def _has_tool_results(self, messages: list) -> bool:
+        """Check if messages contain any tool results."""
+        for msg in messages:
+            role = msg.get("role")
+            if hasattr(role, "value"):
+                role = role.value
+            if role == "tool":
+                return True
+        return False
+
+    def _merge_tools(self, agent_tools: list[dict] | None) -> list[dict] | None:
+        """Merge agent tools with built-in tools if enabled and convert to Responses API format."""
+        merged_tools = []
+        
+        # Add built-in tools first (they take precedence)
+        if self.enable_builtin_tools and self.builtin_tools:
+            for builtin_tool in self.builtin_tools:
+                merged_tools.append(builtin_tool)
+        
+        # Always convert agent tools to Responses API format (flatter structure)
+        if agent_tools:
+            for tool in agent_tools:
+                if tool.get("type") == "function":
+                    func = tool.get("function", {})
+                    merged_tools.append({
+                        "type": "function",
+                        "name": func.get("name"),
+                        "description": func.get("description"),
+                        "parameters": func.get("parameters", {}),
+                    })
+        
+        return merged_tools if merged_tools else None
     def generate(
-        self,
-        messages: list[ChatMessage | dict],
-        stop_sequences: list[str] | None = None,
-        response_format: dict[str, str] | None = None,
-        tools_to_call_from: list[Tool] | None = None,
-        **kwargs,
-    ) -> ChatMessage:
+            self,
+            messages: list[ChatMessage | dict],
+            stop_sequences: list[str] | None = None,
+            response_format: dict[str, str] | None = None,
+            tools_to_call_from: list[Tool] | None = None,
+            **kwargs,
+        ) -> ChatMessage:
         completion_kwargs = self._prepare_completion_kwargs(
             messages=messages,
             stop_sequences=stop_sequences,
@@ -1239,23 +1293,310 @@ class LiteLLMModel(ApiModel):
             custom_role_conversions=self.custom_role_conversions,
             **kwargs,
         )
-        self._apply_rate_limit()
-        response = self.client.completion(**completion_kwargs)
-        if not response.choices:
-            raise RuntimeError(
-                f"Unexpected API response: model '{self.model_id}' returned no choices. "
-                " This may indicate a possible API or upstream issue. "
-                f"Response details: {response.model_dump()}"
-            )
-        return ChatMessage.from_dict(
-            response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
-            raw=response,
-            token_usage=TokenUsage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-            ),
-        )
 
+        if not hasattr(self.client, "responses"):
+            raise RuntimeError("LiteLLMModel: Responses API not available on client")
+
+        request_kwargs = {k: v for k, v in completion_kwargs.items()}
+        request_kwargs.pop("model", None)
+
+        # Merge built-in tools with agent tools
+        agent_tools = request_kwargs.pop("tools", None)
+        merged_tools = self._merge_tools(agent_tools)
+        if merged_tools:
+            request_kwargs["tools"] = merged_tools
+        request_kwargs.pop("tool_choice", None)
+
+        # Convert response_format to Responses API JSON schema
+        response_format_param = request_kwargs.pop("response_format", None)
+        if response_format_param:
+            json_schema = response_format_param.get("json_schema", {})
+            request_kwargs["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": json_schema.get("name", "response"),
+                    "strict": json_schema.get("strict", True),
+                    "schema": json_schema.get("schema", {})
+                }
+            }
+
+        # Add reasoning hint
+        request_kwargs.setdefault("reasoning", {"effort": "medium", "summary": "detailed"})
+
+        input_messages = request_kwargs.pop("messages")
+        if "max_tokens" in request_kwargs:
+            request_kwargs["max_output_tokens"] = request_kwargs.pop("max_tokens")
+
+        try:
+            self._apply_rate_limit()
+
+            # FIX: Simpler threading logic - find tool results and check if they match stored state
+            has_tool_results = self._has_tool_results(input_messages)
+            
+            # Extract tool call IDs from messages
+            tool_result_call_ids = set()
+            if has_tool_results:
+                for m in input_messages:
+                    role = m.get("role")
+                    if hasattr(role, "value"):
+                        role = role.value
+                    if role == "tool" and m.get("tool_call_id"):
+                        tool_result_call_ids.add(m.get("tool_call_id"))
+            
+            # Check if tool results match our stored tool calls
+            should_thread = False
+            if (has_tool_results and 
+                self._last_response_id is not None and 
+                self._last_tool_calls is not None and
+                tool_result_call_ids):
+                
+                # Get the stored tool call IDs
+                stored_call_ids = {tc.id for tc in self._last_tool_calls}
+                
+                # Only thread if ALL tool result IDs match stored tool call IDs
+                if tool_result_call_ids.issubset(stored_call_ids):
+                    should_thread = True
+                    # Find where tool results start (after last assistant message)
+                    last_assistant_idx = self._find_last_assistant_message_index(input_messages)
+                    if last_assistant_idx >= 0:
+                        messages_to_send = input_messages[last_assistant_idx + 1:]
+                    else:
+                        # No assistant message found, send all messages
+                        messages_to_send = input_messages
+                else:
+                    # Tool call IDs don't match - this is a new conversation turn
+                    # Clear state and send all messages
+                    messages_to_send = input_messages
+                    self._last_response_id = None
+                    self._last_tool_calls = None
+            else:
+                # No threading conditions met
+                messages_to_send = input_messages
+                self._last_response_id = None
+                self._last_tool_calls = None
+
+            # Convert messages to Responses API format
+            responses_input = []
+            if isinstance(messages_to_send, list):
+                for m in messages_to_send:
+                    role = m.get("role")
+                    if hasattr(role, "value"):
+                        role = role.value
+                    content = m.get("content")
+
+                    # Handle tool responses
+                    if role == "tool" and m.get("tool_call_id") is not None:
+                        if isinstance(content, list):
+                            try:
+                                content_text = "\n".join([
+                                    el.get("text", "")
+                                    for el in content
+                                    if isinstance(el, dict) and el.get("type") in ("text", "input_text", "output_text")
+                                ]).strip()
+                            except Exception:
+                                content_text = str(content)
+                        else:
+                            content_text = content or ""
+                        
+                        # FIX: Validate that this call_id is in our stored tool calls before adding
+                        call_id = m.get("tool_call_id")
+                        if should_thread and self._last_tool_calls:
+                            stored_ids = {tc.id for tc in self._last_tool_calls}
+                            if call_id in stored_ids:
+                                responses_input.append({
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": content_text,
+                                })
+                        else:
+                            # Not threading, skip function_call_output format
+                            # Convert to regular user message instead
+                            responses_input.append({
+                                "role": "user",
+                                "content": [{
+                                    "type": "input_text",
+                                    "text": f"Tool result: {content_text}"
+                                }]
+                            })
+                        continue
+
+                    # Skip empty assistant messages
+                    if role == "assistant" and (not content or content == []):
+                        continue
+
+                    mapped_role = role if role != "tool" else "user"
+                    new_msg = {"role": mapped_role, "content": []}
+
+                    if isinstance(content, list):
+                        for el in content:
+                            if not isinstance(el, dict):
+                                new_msg["content"].append({
+                                    "type": "output_text" if mapped_role == "assistant" else "input_text",
+                                    "text": str(el),
+                                })
+                                continue
+                            el_type = el.get("type")
+                            if el_type in ("text", "input_text", "output_text"):
+                                new_msg["content"].append({
+                                    "type": "output_text" if mapped_role == "assistant" else "input_text",
+                                    "text": el.get("text", ""),
+                                })
+                            elif el_type == "image_url":
+                                new_msg["content"].append({
+                                    "type": "input_image",
+                                    "image_url": el.get("image_url")
+                                })
+                            else:
+                                text_val = el.get("text") if "text" in el else str(el)
+                                new_msg["content"].append({
+                                    "type": "output_text" if mapped_role == "assistant" else "input_text",
+                                    "text": text_val or "",
+                                })
+                    else:
+                        text_val = content if isinstance(content, str) else ("" if content is None else str(content))
+                        new_msg["content"] = [{
+                            "type": "output_text" if mapped_role == "assistant" else "input_text",
+                            "text": text_val,
+                        }]
+
+                    responses_input.append(new_msg)
+
+            # Only set previous_response_id if we're actually threading with valid tool results
+            if should_thread and self._last_response_id is not None:
+                request_kwargs["previous_response_id"] = self._last_response_id
+
+            # Final sanitization
+            for msg in responses_input:
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role == "tool":
+                    msg["role"] = "user"
+                    role = "user"
+                blocks = msg.get("content", [])
+                if isinstance(blocks, list):
+                    for b in blocks:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text":
+                            b["type"] = "output_text" if role == "assistant" else "input_text"
+                        if b.get("type") == "image_url":
+                            b["type"] = "input_image"
+                        if b.get("type") == "input_text" and role == "assistant":
+                            b["type"] = "output_text"
+
+            # === Execute responses API ===
+            response = self.client.responses(
+                model=self.model_id,
+                input=responses_input,
+                **request_kwargs
+            )
+
+            # === Parse the output ===
+            output_text = ""
+            tool_calls = []
+
+            for item in response.output:
+                item_type = getattr(item, "type", None)
+
+                # Collect text blocks
+                if hasattr(item, "content") and isinstance(item.content, list):
+                    for content_block in item.content:
+                        if hasattr(content_block, "text"):
+                            output_text += content_block.text
+
+                # Convert built-in web_search to a normal tool call
+                if item_type == "web_search":
+                    call_id = getattr(item, "id", str(uuid.uuid4()))
+                    query = getattr(item, "query", None)
+                    tool_calls.append(
+                        ChatMessageToolCall(
+                            id=call_id,
+                            type="function",
+                            function=ChatMessageToolCallFunction(
+                                name="web_search",
+                                arguments={"query": query},
+                            )
+                        )
+                    )
+                    continue
+
+                # Handle function/tool calls normally
+                if item_type in ("function_call", "tool_call"):
+                    call_id = getattr(item, "call_id", getattr(item, "id", str(uuid.uuid4())))
+                    name = getattr(item, "name", None)
+                    arguments = getattr(item, "arguments", None)
+                    if name:
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except Exception:
+                                pass
+                        tool_calls.append(
+                            ChatMessageToolCall(
+                                id=call_id,
+                                type="function",
+                                function=ChatMessageToolCallFunction(
+                                    name=name,
+                                    arguments=arguments,
+                                ),
+                            )
+                        )
+
+            # Auto-wrap direct text responses in final_answer only if no tool calls exist
+            if output_text and not tool_calls and agent_tools:
+                has_final_answer = any(
+                    tool.get("function", {}).get("name") == "final_answer"
+                    for tool in agent_tools
+                    if tool.get("type") == "function"
+                )
+                if has_final_answer:
+                    logger.info("Auto-wrapping direct response in final_answer tool call")
+                    tool_calls.append(
+                        ChatMessageToolCall(
+                            id=str(uuid.uuid4()),
+                            type="function",
+                            function=ChatMessageToolCallFunction(
+                                name="final_answer",
+                                arguments={"answer": output_text},
+                            ),
+                        )
+                    )
+                    output_text = ""
+
+            # Track tool call state for threading
+            if tool_calls:
+                try:
+                    self._last_response_id = getattr(response, "id", None)
+                    self._last_tool_calls = tool_calls
+                except Exception:
+                    self._last_response_id = None
+                    self._last_tool_calls = None
+            else:
+                # No tool calls in this response, clear state
+                self._last_response_id = None
+                self._last_tool_calls = None
+
+            usage = getattr(response, "usage", None)
+            input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+            output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=output_text,
+                raw=response,
+                token_usage=TokenUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                ),
+                tool_calls=tool_calls if tool_calls else None,
+            )
+
+        except Exception as e:
+            # Clear state on error to prevent cascading failures
+            self._last_response_id = None
+            self._last_tool_calls = None
+            raise RuntimeError(f"LiteLLMModel: responses() failed: {e}")
     def generate_stream(
         self,
         messages: list[ChatMessage | dict],
@@ -1264,49 +1605,23 @@ class LiteLLMModel(ApiModel):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> Generator[ChatMessageStreamDelta]:
-        completion_kwargs = self._prepare_completion_kwargs(
-            messages=messages,
-            stop_sequences=stop_sequences,
-            response_format=response_format,
-            tools_to_call_from=tools_to_call_from,
-            model=self.model_id,
-            api_base=self.api_base,
-            api_key=self.api_key,
-            custom_role_conversions=self.custom_role_conversions,
-            convert_images_to_image_urls=True,
-            **kwargs,
-        )
-        self._apply_rate_limit()
-        for event in self.client.completion(**completion_kwargs, stream=True, stream_options={"include_usage": True}):
-            if getattr(event, "usage", None):
-                yield ChatMessageStreamDelta(
-                    content="",
-                    token_usage=TokenUsage(
-                        input_tokens=event.usage.prompt_tokens,
-                        output_tokens=event.usage.completion_tokens,
-                    ),
-                )
-            if event.choices:
-                choice = event.choices[0]
-                if choice.delta:
-                    yield ChatMessageStreamDelta(
-                        content=choice.delta.content,
-                        tool_calls=[
-                            ChatMessageToolCallStreamDelta(
-                                index=delta.index,
-                                id=delta.id,
-                                type=delta.type,
-                                function=delta.function,
-                            )
-                            for delta in choice.delta.tool_calls
-                        ]
-                        if choice.delta.tool_calls
-                        else None,
-                    )
-                else:
-                    if not getattr(choice, "finish_reason", None):
-                        raise ValueError(f"No content or tool calls in event: {event}")
-
+        # Prefer Responses API if available: emit a single aggregated delta for compatibility
+        if hasattr(self.client, "responses"):
+            message = self.generate(
+                messages=messages,
+                stop_sequences=stop_sequences,
+                response_format=response_format,
+                tools_to_call_from=tools_to_call_from,
+                **kwargs,
+            )
+            yield ChatMessageStreamDelta(
+                content=message.content,
+                tool_calls=None,
+                token_usage=message.token_usage,
+            )
+            return
+        else:
+            raise RuntimeError("LiteLLMModel: Responses API not available on client; streaming via completions is disabled.")
 
 class LiteLLMRouterModel(LiteLLMModel):
     """Router‑based client for interacting with the [LiteLLM Python SDK Router](https://docs.litellm.ai/docs/routing).
@@ -1506,30 +1821,195 @@ class InferenceClientModel(ApiModel):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> ChatMessage:
-        if response_format is not None and self.client_kwargs["provider"] not in STRUCTURED_GENERATION_PROVIDERS:
-            raise ValueError(
-                "InferenceClientModel only supports structured outputs with these providers:"
-                + ", ".join(STRUCTURED_GENERATION_PROVIDERS)
-            )
         completion_kwargs = self._prepare_completion_kwargs(
             messages=messages,
             stop_sequences=stop_sequences,
+            response_format=response_format,
             tools_to_call_from=tools_to_call_from,
-            # response_format=response_format,
-            convert_images_to_image_urls=True,
+            model=self.model_id,
             custom_role_conversions=self.custom_role_conversions,
+            convert_images_to_image_urls=True,
             **kwargs,
         )
-        self._apply_rate_limit()
-        response = self.client.chat_completion(**completion_kwargs)
-        return ChatMessage.from_dict(
-            asdict(response.choices[0].message),
-            raw=response,
-            token_usage=TokenUsage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-            ),
-        )
+        
+        # Try Responses API first
+        try:
+            request_kwargs = {k: v for k, v in completion_kwargs.items()}
+            request_kwargs.pop("model", None)
+            input_messages = request_kwargs.pop("messages")
+            
+            # Convert max_tokens to max_output_tokens for Responses API
+            if "max_tokens" in request_kwargs:
+                request_kwargs["max_output_tokens"] = request_kwargs.pop("max_tokens")
+            
+            # Convert tools to Responses API format
+            tools = request_kwargs.pop("tools", None)
+            if tools:
+                # Responses API expects a flatter tool structure
+                # Convert from OpenAI Chat Completions format to Responses format
+                responses_tools = []
+                for tool in tools:
+                    if tool.get("type") == "function":
+                        func = tool.get("function", {})
+                        responses_tools.append({
+                            "name": func.get("name"),
+                            "description": func.get("description"),
+                            "parameters": func.get("parameters", {}),
+                        })
+                if responses_tools:
+                    request_kwargs["tools"] = responses_tools
+            
+            request_kwargs.pop("tool_choice", None)  # Responses API doesn't use tool_choice
+            
+            self._apply_rate_limit()
+            
+            # Convert chat messages to Responses API input format
+            responses_input = []
+            for msg in input_messages:
+                role = msg.get("role")
+                content = msg.get("content")
+                tool_calls = msg.get("tool_calls")
+                tool_call_id = msg.get("tool_call_id")
+                
+                # Handle tool response messages
+                if role == "tool" and tool_call_id:
+                    # Extract text content
+                    if isinstance(content, list):
+                        text_parts = [
+                            el.get("text", "") 
+                            for el in content 
+                            if isinstance(el, dict) and el.get("type") == "text"
+                        ]
+                        content_text = "\n".join(text_parts) if text_parts else str(content)
+                    else:
+                        content_text = content or ""
+                    
+                    # Add tool result in Responses format
+                    responses_input.append({
+                        "type": "function_call_output",
+                        "tool_call_id": tool_call_id,
+                        "output": content_text,
+                    })
+                    continue
+                
+                # Handle assistant messages with tool calls
+                if tool_calls:
+                    # First add any text content
+                    if content:
+                        text_val = content if isinstance(content, str) else str(content)
+                        responses_input.append({
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": text_val
+                            }]
+                        })
+                    
+                    # Then add tool calls
+                    for tc in tool_calls:
+                        responses_input.append({
+                            "type": "tool_call",
+                            "call_id": tc.get("id"),
+                            "name": tc.get("function", {}).get("name"),
+                            "arguments": tc.get("function", {}).get("arguments"),
+                        })
+                    continue
+                
+                # Skip empty assistant messages
+                if role == "assistant" and (content is None or content == "" or content == []):
+                    continue
+                
+                # Map role (tool -> user)
+                if role == "tool":
+                    role = "user"
+                
+                # Build message content
+                new_msg = {"role": role, "content": []}
+                
+                if isinstance(content, list):
+                    for el in content:
+                        if not isinstance(el, dict):
+                            new_msg["content"].append({
+                                "type": "output_text" if role == "assistant" else "input_text",
+                                "text": str(el)
+                            })
+                            continue
+                        
+                        el_type = el.get("type")
+                        if el_type in ("text", "input_text", "output_text"):
+                            new_msg["content"].append({
+                                "type": "output_text" if role == "assistant" else "input_text",
+                                "text": el.get("text", "")
+                            })
+                        elif el_type == "image_url":
+                            new_msg["content"].append({
+                                "type": "input_image",
+                                "image_url": el.get("image_url")
+                            })
+                        else:
+                            text_val = el.get("text", str(el))
+                            new_msg["content"].append({
+                                "type": "output_text" if role == "assistant" else "input_text",
+                                "text": text_val
+                            })
+                else:
+                    text_val = content if isinstance(content, str) else ("" if content is None else str(content))
+                    new_msg["content"] = [{
+                        "type": "output_text" if role == "assistant" else "input_text",
+                        "text": text_val
+                    }]
+                
+                responses_input.append(new_msg)
+            
+            # Call Responses API
+            response = self.client.responses.create(
+                model=self.model_id, 
+                input=responses_input, 
+                **request_kwargs
+            )
+            
+            # Extract output text
+            output_text = ""
+            tool_calls = []
+            
+            for item in response.output:
+                # Handle text content
+                if hasattr(item, "content") and isinstance(item.content, list):
+                    for content_block in item.content:
+                        if hasattr(content_block, "text"):
+                            output_text += content_block.text
+                
+                # Handle tool calls
+                if hasattr(item, "type") and item.type == "tool_call":
+                    tool_calls.append(
+                        ChatMessageToolCall(
+                            id=item.call_id,
+                            type="function",
+                            function=ChatMessageToolCallFunction(
+                                name=item.name,
+                                arguments=item.arguments
+                            )
+                        )
+                    )
+            
+            # Get token usage
+            usage = response.usage
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=output_text,
+                tool_calls=tool_calls if tool_calls else None,
+                raw=response,
+                token_usage=TokenUsage(
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                ),
+            )
+            
+        except Exception as e:
+            # If Responses API fails, raise error (strict mode)
+            raise RuntimeError(
+                f"OpenAIServerModel: Responses API failed: {e}"
+            )
 
     def generate_stream(
         self,
@@ -1652,48 +2132,20 @@ class OpenAIServerModel(ApiModel):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> Generator[ChatMessageStreamDelta]:
-        completion_kwargs = self._prepare_completion_kwargs(
+        # For Responses API, emit a single aggregated delta built from the non-streaming result
+        # to preserve compatibility with existing streaming consumers.
+        message = self.generate(
             messages=messages,
             stop_sequences=stop_sequences,
             response_format=response_format,
             tools_to_call_from=tools_to_call_from,
-            model=self.model_id,
-            custom_role_conversions=self.custom_role_conversions,
-            convert_images_to_image_urls=True,
             **kwargs,
         )
-        self._apply_rate_limit()
-        for event in self.client.chat.completions.create(
-            **completion_kwargs, stream=True, stream_options={"include_usage": True}
-        ):
-            if event.usage:
-                yield ChatMessageStreamDelta(
-                    content="",
-                    token_usage=TokenUsage(
-                        input_tokens=event.usage.prompt_tokens,
-                        output_tokens=event.usage.completion_tokens,
-                    ),
-                )
-            if event.choices:
-                choice = event.choices[0]
-                if choice.delta:
-                    yield ChatMessageStreamDelta(
-                        content=choice.delta.content,
-                        tool_calls=[
-                            ChatMessageToolCallStreamDelta(
-                                index=delta.index,
-                                id=delta.id,
-                                type=delta.type,
-                                function=delta.function,
-                            )
-                            for delta in choice.delta.tool_calls
-                        ]
-                        if choice.delta.tool_calls
-                        else None,
-                    )
-                else:
-                    if not getattr(choice, "finish_reason", None):
-                        raise ValueError(f"No content or tool calls in event: {event}")
+        yield ChatMessageStreamDelta(
+            content=message.content,
+            tool_calls=None,
+            token_usage=message.token_usage,
+        )
 
     def generate(
         self,
@@ -1713,16 +2165,113 @@ class OpenAIServerModel(ApiModel):
             convert_images_to_image_urls=True,
             **kwargs,
         )
-        self._apply_rate_limit()
-        response = self.client.chat.completions.create(**completion_kwargs)
-        return ChatMessage.from_dict(
-            response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
-            raw=response,
-            token_usage=TokenUsage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-            ),
-        )
+        # Try Responses API first; fall back to Chat Completions with a warning on failure.
+        try:
+            request_kwargs = {k: v for k, v in completion_kwargs.items()}
+            # Avoid duplicate 'model' arg when calling client.responses.create(model=..., **request_kwargs)
+            request_kwargs.pop("model", None)
+            input_messages = request_kwargs.pop("messages")
+            if "max_tokens" in request_kwargs:
+                request_kwargs["max_output_tokens"] = request_kwargs.pop("max_tokens")
+
+            self._apply_rate_limit()
+            # Convert chat-style messages into Responses API input schema
+            responses_input = input_messages
+            if isinstance(input_messages, list):
+                converted_messages = []
+                for m in input_messages:
+                    role = m.get("role")
+                    if role == "tool":
+                        role = "user"
+                    content = m.get("content")
+                    new_msg = {"role": role, "content": []}
+                    if isinstance(content, list):
+                        for el in content:
+                            if not isinstance(el, dict):
+                                new_msg["content"].append({
+                                    "type": "output_text" if role == "assistant" else "input_text",
+                                    "text": str(el)
+                                })
+                                continue
+                            el_type = el.get("type")
+                            if el_type == "text":
+                                new_msg["content"].append({
+                                    "type": "output_text" if role == "assistant" else "input_text",
+                                    "text": el.get("text", "")
+                                })
+                            elif el_type == "image_url":
+                                image_url = el.get("image_url")
+                                new_msg["content"].append({"type": "input_image", "image_url": image_url})
+                            else:
+                                text_val = el.get("text") if "text" in el else str(el)
+                                new_msg["content"].append({
+                                    "type": "output_text" if role == "assistant" else "input_text",
+                                    "text": text_val or ""
+                                })
+                    else:
+                        text_val = content if isinstance(content, str) else ("" if content is None else str(content))
+                        new_msg["content"] = [{
+                            "type": "output_text" if role == "assistant" else "input_text",
+                            "text": text_val
+                        }]
+                    converted_messages.append(new_msg)
+                responses_input = converted_messages
+
+            # Final sanitation: ensure all content block types conform to Responses API
+            try:
+                for msg in responses_input:
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get("role")
+                    if role == "tool":
+                        msg["role"] = "user"
+                        role = "user"
+                    blocks = msg.get("content", [])
+                    if isinstance(blocks, list):
+                        for b in blocks:
+                            if not isinstance(b, dict):
+                                continue
+                            if b.get("type") == "text":
+                                b["type"] = "output_text" if role == "assistant" else "input_text"
+                            if b.get("type") == "image_url":
+                                b["type"] = "input_image"
+                            if b.get("type") == "input_text" and role == "assistant":
+                                b["type"] = "output_text"
+            except Exception:
+                pass
+
+            response = self.client.responses.create(model=self.model_id, input=responses_input, **request_kwargs)
+
+            output_text = ""
+            try:
+                for item in getattr(response, "output", []) or []:
+                    content_list = getattr(item, "content", None)
+                    if isinstance(content_list, list):
+                        for content in content_list:
+                            text_val = getattr(content, "text", None)
+                            if isinstance(text_val, str):
+                                output_text += text_val
+            except Exception:
+                output_text = str(getattr(response, "output", "")) or str(response)
+
+            usage = getattr(response, "usage", None)
+            input_tokens = getattr(usage, "input_tokens", getattr(usage, "prompt_tokens", 0)) if usage else 0
+            output_tokens = getattr(usage, "output_tokens", getattr(usage, "completion_tokens", 0)) if usage else 0
+
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=output_text,
+                raw=response,
+                token_usage=TokenUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                ),
+            )
+        except Exception as e:
+            # Strict Responses-only mode
+            raise RuntimeError(
+                f"OpenAIServerModel: responses.create failed and completions are disabled: {e}"
+            )
 
 
 OpenAIModel = OpenAIServerModel
