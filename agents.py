@@ -1314,6 +1314,14 @@ class ToolCallingAgent(MultiStepAgent):
             try:
                 chat_message = self.model.parse_tool_calls(chat_message)
             except Exception as e:
+                try:
+                    self.logger.log_markdown(
+                        content=str(chat_message.content) if chat_message.content is not None else str(chat_message.raw) or "",
+                        title="Model output before tool-call parsing failed:",
+                        level=LogLevel.INFO,
+                    )
+                except Exception:
+                    pass
                 raise AgentParsingError(f"Error while parsing tool call from model output: {e}", self.logger)
         else:
             for tool_call in chat_message.tool_calls:
